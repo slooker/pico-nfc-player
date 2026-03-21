@@ -19,10 +19,8 @@
 
 #ifdef PICO_AUDIO_I2S_ENABLED
 #include "pico/audio_i2s.h"
-#include "audio_i2s.pio.h"
 #include "hardware/pio.h"
 #include "hardware/dma.h"
-#include "hardware/clocks.h"
 #endif
 
 // ---- WiFi credentials ----
@@ -79,129 +77,82 @@ static uint8_t g_decode_scratch[4096];
 // ---- I2S audio (Phase 3 — requires pico-extras) ----
 #ifdef PICO_AUDIO_I2S_ENABLED
 
-// Raw I2S state — bypasses pico-extras buffer pool entirely
-static uint g_i2s_sm = 0;
-static uint g_i2s_dma = 0;
-
-// Stereo PCM16 buffer: 1152 stereo pairs, 4 bytes each = 4608 bytes
-static int16_t g_audio_buf[2][1152 * 2];
-static uint    g_audio_buf_idx = 0;
+static audio_buffer_pool_t *g_audio_pool;
 
 static void audio_init(uint32_t sample_rate) {
-    // --- PIO setup ---
-    int sm = pio_claim_unused_sm(pio0, false);
-    if (sm < 0) { printf("No free PIO0 SM\n"); return; }
-    g_i2s_sm = (uint)sm;
+    audio_format_t fmt = {
+        .sample_freq  = sample_rate,
+        .format       = AUDIO_BUFFER_FORMAT_PCM_S16,
+        .channel_count = 2,
+    };
+    audio_buffer_format_t producer_fmt = {
+        .format       = &fmt,
+        .sample_stride = 4,  // 2 channels × 2 bytes
+    };
+    g_audio_pool = audio_new_producer_pool(&producer_fmt, 3, 1152);
+    printf("audio pool created\n");
 
-    gpio_set_function(PICO_AUDIO_I2S_DATA_PIN,          GPIO_FUNC_PIO0);
-    gpio_set_function(PICO_AUDIO_I2S_CLOCK_PIN_BASE,     GPIO_FUNC_PIO0);
-    gpio_set_function(PICO_AUDIO_I2S_CLOCK_PIN_BASE + 1, GPIO_FUNC_PIO0);
+    // Find free PIO SM and DMA channel (CYW43 and USB may already own some)
+    extern PIO audio_pio;  // defined inside pico_audio_i2s as pio1
+    int free_sm = pio_claim_unused_sm(pio1, false);
+    if (free_sm < 0) { printf("No free PIO SM!\n"); return; }
+    pio_sm_unclaim(pio1, (uint)free_sm);
 
-    uint offset = pio_add_program(pio0, &audio_i2s_program);
-    audio_i2s_program_init(pio0, g_i2s_sm, offset,
-                           PICO_AUDIO_I2S_DATA_PIN,
-                           PICO_AUDIO_I2S_CLOCK_PIN_BASE);
+    int free_dma = dma_claim_unused_channel(false);
+    if (free_dma < 0) { printf("No free DMA channel!\n"); return; }
+    dma_channel_unclaim((uint)free_dma);
 
-    // PIO clock divider: need bit_clock = sample_rate * 32 * 2
-    // Each PIO cycle = 1 bit, and the I2S program outputs 32 bits per channel
-    uint32_t sys_clk = clock_get_hz(clk_sys);
-    uint32_t divider = sys_clk * 4 / sample_rate;
-    pio_sm_set_clkdiv_int_frac(pio0, g_i2s_sm, divider >> 8u, divider & 0xffu);
+    printf("Using PIO1 SM%d, DMA ch%d\n", free_sm, free_dma);
 
-    printf("PIO0 SM%u loaded at offset %u, divider=%u\n", g_i2s_sm, offset, divider);
-
-    // --- DMA setup ---
-    int dma_ch = dma_claim_unused_channel(false);
-    if (dma_ch < 0) { printf("No free DMA ch\n"); return; }
-    g_i2s_dma = (uint)dma_ch;
-
-    dma_channel_config dc = dma_channel_get_default_config(g_i2s_dma);
-    channel_config_set_dreq(&dc, DREQ_PIO0_TX0 + g_i2s_sm);
-    channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);
-    channel_config_set_read_increment(&dc, true);
-    channel_config_set_write_increment(&dc, false);
-    dma_channel_configure(g_i2s_dma, &dc,
-                          &pio0->txf[g_i2s_sm],  // dest: PIO TX FIFO
-                          NULL,                   // src set per transfer
-                          0,                      // count set per transfer
-                          false);                 // don't start yet
-
-    printf("DMA ch%u -> PIO0 TX FIFO SM%u (DREQ %u)\n",
-           g_i2s_dma, g_i2s_sm, DREQ_PIO0_TX0 + g_i2s_sm);
-
-    // --- Unmute PCM5100A (XSMT = GP22 on PIM544) ---
-    gpio_init(22);
-    gpio_set_dir(22, GPIO_OUT);
-    gpio_put(22, 1);
-    printf("PCM5100A unmuted (GP22 HIGH)\n");
-
-    // Enable PIO SM
-    pio_sm_set_enabled(pio0, g_i2s_sm, true);
-    printf("Audio init done: %luHz\n", (unsigned long)sample_rate);
-    stdio_flush();
-}
-
-// Submit one block of stereo PCM16 samples via polling DMA (no IRQ needed).
-// Uses double buffering: fills the idle buffer while DMA plays the other.
-static void audio_submit_raw(const int16_t *pcm, uint32_t stereo_pairs) {
-    uint32_t next_idx = g_audio_buf_idx ^ 1;
-    memcpy(g_audio_buf[next_idx], pcm, stereo_pairs * 4);
-    // Wait for previous DMA to finish, then kick off the next transfer
-    dma_channel_wait_for_finish_blocking(g_i2s_dma);
-    dma_channel_transfer_from_buffer_now(g_i2s_dma, g_audio_buf[next_idx], stereo_pairs);
-    g_audio_buf_idx = next_idx;
+    audio_i2s_config_t config = {
+        .data_pin       = PICO_AUDIO_I2S_DATA_PIN,
+        .clock_pin_base = PICO_AUDIO_I2S_CLOCK_PIN_BASE,
+        .dma_channel    = (uint8_t)free_dma,
+        .pio_sm         = (uint8_t)free_sm,
+    };
+    const audio_format_t *actual = audio_i2s_setup(&fmt, &config);
+    printf("audio_i2s_setup done: %p\n", actual);
+    audio_i2s_connect(g_audio_pool);
+    printf("audio_i2s_connect done\n");
+    audio_i2s_set_enabled(true);
+    printf("Audio initialised: %luHz stereo\n", (unsigned long)sample_rate);
 }
 
 static void play_test_tone(void) {
     printf("Playing 440Hz test tone for 2 seconds...\n");
-    stdio_flush();
-
-    const uint32_t sample_rate  = 44100;
-    const uint32_t total_frames = sample_rate * 2;
-    const uint32_t half_cycle   = sample_rate / (440 * 2);
-    const uint32_t chunk        = 1152;
+    const uint32_t tone_freq   = 440;
+    const uint32_t sample_rate = 44100;
+    const uint32_t total_frames = sample_rate * 2;  // 2 seconds
+    const uint32_t half_cycle  = sample_rate / (tone_freq * 2);  // ~50 samples
 
     uint32_t frames_done = 0, half_pos = 0;
-    int16_t  level = 16000;
-
-    // Prime DMA with silence so the first wait_for_finish returns quickly
-    memset(g_audio_buf[0], 0, sizeof(g_audio_buf[0]));
-    dma_channel_transfer_from_buffer_now(g_i2s_dma, g_audio_buf[0], chunk);
-    g_audio_buf_idx = 0;
+    int16_t level = 16000;
 
     while (frames_done < total_frames) {
-        uint32_t n = chunk;
+        printf("Frames done: %d\n", frames_done);
+        audio_buffer_t *buf = take_audio_buffer(g_audio_pool, true);
+        int16_t *out = (int16_t *)buf->buffer->bytes;
+        uint32_t n = 1152;
         if (frames_done + n > total_frames) n = total_frames - frames_done;
-
-        // Fill the idle buffer
-        int16_t *out = g_audio_buf[g_audio_buf_idx ^ 1];
         for (uint32_t i = 0; i < n; i++) {
             out[i * 2]     = level;
             out[i * 2 + 1] = level;
             if (++half_pos >= half_cycle) { level = -level; half_pos = 0; }
         }
-
-        // Wait for current DMA then swap
-        dma_channel_wait_for_finish_blocking(g_i2s_dma);
-        g_audio_buf_idx ^= 1;
-        dma_channel_transfer_from_buffer_now(g_i2s_dma, g_audio_buf[g_audio_buf_idx], n);
-
+        buf->sample_count = n;
+        give_audio_buffer(g_audio_pool, buf);
         frames_done += n;
-        if (frames_done % (chunk * 16) == 0) {
-            printf("frames=%lu dma_busy=%d\n",
-                   (unsigned long)frames_done,
-                   (int)dma_channel_is_busy(g_i2s_dma));
-            stdio_flush();
-        }
     }
-    dma_channel_wait_for_finish_blocking(g_i2s_dma);
     printf("Test tone done.\n");
-    stdio_flush();
 }
 
 static void audio_submit_frame(int16_t *pcm, int sample_count) {
-    // sample_count = total samples (L+R interleaved), so stereo_pairs = sample_count/2
-    audio_submit_raw(pcm, (uint32_t)(sample_count / 2));
+    audio_buffer_t *buf = take_audio_buffer(g_audio_pool, false);
+    if (!buf) return;  // no buffer available, skip frame rather than block
+    int16_t *out = (int16_t *)buf->buffer->bytes;
+    memcpy(out, pcm, sample_count * sizeof(int16_t));
+    buf->sample_count = sample_count / 2;  // stereo pairs
+    give_audio_buffer(g_audio_pool, buf);
 }
 
 #endif  // PICO_AUDIO_I2S_ENABLED
@@ -458,22 +409,22 @@ int main(void) {
 
     printf("Pico NFC Player starting...\n");
 
-    // mp3dec_init(&g_mp3dec);
+    mp3dec_init(&g_mp3dec);
     ring_buf_init(&g_ring);
 
-    // if (cyw43_arch_init()) {
-    //     printf("WiFi init failed!\n");
-    //     return -1;
-    // }
-    // cyw43_arch_enable_sta_mode();
+    if (cyw43_arch_init()) {
+        printf("WiFi init failed!\n");
+        return -1;
+    }
+    cyw43_arch_enable_sta_mode();
 
-    // printf("Connecting to WiFi: %s\n", WIFI_SSID);
-    // if (cyw43_arch_wifi_connect_timeout_ms(
-    //         WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_MIXED_PSK, 30000) != 0) {
-    //     printf("WiFi connect failed\n");
-    //     return -1;
-    // }
-    // printf("WiFi connected! IP: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_default)));
+    printf("Connecting to WiFi: %s\n", WIFI_SSID);
+    if (cyw43_arch_wifi_connect_timeout_ms(
+            WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_MIXED_PSK, 30000) != 0) {
+        printf("WiFi connect failed\n");
+        return -1;
+    }
+    printf("WiFi connected! IP: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_default)));
 
     // Phase 4 placeholder: in the final design this fires when an NFC tag is scanned.
     // For now, auto-start with the first map entry so Phases 2+3 can be tested.
@@ -483,15 +434,69 @@ int main(void) {
     // uint32_t frame_count   = 0;
     // uint32_t total_samples = 0;
 
-#ifdef PICO_AUDIO_I2S_ENABLED
-    audio_init(44100);
-    printf("Starting test tone\n");
-    play_test_tone();
-    printf("Done playing test tone\n");
-#endif
-
     while (true) {
-        tight_loop_contents();
+        // cyw43_arch_poll();
+
+    //     // Decode one MP3 frame per loop iteration when enough data is buffered.
+    //     static bool s_ring_low_reported = false;
+    //     uint32_t ring_avail = ring_buf_available(&g_ring);
+    //     if (audio_started && ring_avail < MINIMP3_MIN_DATA_CHUNK_SIZE && !s_ring_low_reported) {
+    //         printf("Ring buffer low (%lu bytes), waiting for network...\n", (unsigned long)ring_avail);
+    //         s_ring_low_reported = true;
+    //     } else if (ring_avail >= MINIMP3_MIN_DATA_CHUNK_SIZE) {
+    //         s_ring_low_reported = false;
+    //     }
+    //     if (ring_avail >= MINIMP3_MIN_DATA_CHUNK_SIZE) {
+    //         uint32_t to_read = (ring_avail < sizeof(g_decode_scratch))
+    //                            ? ring_avail : sizeof(g_decode_scratch);
+
+    //         ring_buf_peek(&g_ring, g_decode_scratch, to_read);
+
+    //         int samples = mp3dec_decode_frame(
+    //             &g_mp3dec, g_decode_scratch, (int)to_read,
+    //             g_pcm_buf, &g_frame_info);
+
+    //         if (g_frame_info.frame_bytes > 0) {
+    //             ring_buf_consume(&g_ring, (uint32_t)g_frame_info.frame_bytes);
+    //         } else if (ring_avail > 0) {
+    //             // No valid sync found — skip one byte and try again next iteration
+    //             ring_buf_consume(&g_ring, 1);
+    //         }
+
+    //         if (samples > 0) {
+    //             if (!audio_started) {
+    //                 printf("Decoded first frame: %dHz, %dch, %d kbps\n",
+    //                        g_frame_info.hz, g_frame_info.channels,
+    //                        g_frame_info.bitrate_kbps);
+#ifdef PICO_AUDIO_I2S_ENABLED
+                    printf("PICO_AUDIO_I2S_ENABLED");
+                    audio_init(44100);
+                    printf("Starting test tone\n");
+                    play_test_tone();
+                    printf("Done playing test tone\n");
+#endif
+//                     audio_started = true;
+//                 }
+
+//                 frame_count++;
+//                 total_samples += (uint32_t)samples;
+
+//                 // Print stats every 50 frames (~1.3 seconds at 38fps)
+//                 if (frame_count % 50 == 0) {
+//                     uint32_t seconds = total_samples / (uint32_t)g_frame_info.hz;
+//                     printf("Decoded %lu frames, ~%lu:%02lu, ring: %lu\n",
+//                            (unsigned long)frame_count,
+//                            (unsigned long)(seconds / 60),
+//                            (unsigned long)(seconds % 60),
+//                            (unsigned long)ring_buf_available(&g_ring));
+//                 }
+
+// #ifdef PICO_AUDIO_I2S_ENABLED
+//                 audio_submit_frame(g_pcm_buf, samples * g_frame_info.channels);
+// #endif
+//             }
+//         }
+
     }
 
     // cyw43_arch_deinit();

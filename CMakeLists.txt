@@ -63,7 +63,7 @@ target_include_directories(pico_nfc_player PRIVATE
 
 set(LINK_LIBS
     pico_stdlib
-    pico_cyw43_arch_lwip_threadsafe_background
+    pico_cyw43_arch_lwip_poll
     pico_lwip_mbedtls
     pico_mbedtls
 )
