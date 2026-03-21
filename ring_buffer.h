@@ -5,10 +5,12 @@
 // Power-of-2 size so index masking works correctly
 #define RING_BUF_SIZE (32 * 1024)
 
+// SPSC ring buffer: one producer (network IRQ) and one consumer (main thread).
+// volatile + __dmb() provide the ordering guarantees needed on Cortex-M33.
 typedef struct {
-    uint8_t  buf[RING_BUF_SIZE];
-    uint32_t head;  // write cursor (never masked)
-    uint32_t tail;  // read  cursor (never masked)
+    uint8_t           buf[RING_BUF_SIZE];
+    volatile uint32_t head;  // write cursor — updated by producer only
+    volatile uint32_t tail;  // read  cursor — updated by consumer only
 } ring_buf_t;
 
 static inline void ring_buf_init(ring_buf_t *rb) {
@@ -24,6 +26,7 @@ static inline uint32_t ring_buf_free(const ring_buf_t *rb) {
 }
 
 // Write up to len bytes; returns bytes actually written (drops if full).
+// Called from IRQ (producer). DMB ensures buf[] writes are visible before head update.
 static inline uint32_t ring_buf_write(ring_buf_t *rb, const uint8_t *data, uint32_t len) {
     uint32_t space = ring_buf_free(rb);
     if (len > space) len = space;
@@ -36,13 +39,16 @@ static inline uint32_t ring_buf_write(ring_buf_t *rb, const uint8_t *data, uint3
     if (len > first)
         memcpy(rb->buf, data + first, len - first);
 
+    __asm volatile("dmb" ::: "memory");  // ensure buf[] writes complete before head is updated
     rb->head += len;
     return len;
 }
 
 // Copy len bytes to dst without advancing the tail (non-destructive peek).
+// Called from main thread (consumer). DMB ensures head is read before buf[] is accessed.
 static inline uint32_t ring_buf_peek(ring_buf_t *rb, uint8_t *dst, uint32_t len) {
     uint32_t avail = ring_buf_available(rb);
+    __asm volatile("dmb" ::: "memory");  // ensure head read (inside ring_buf_available) completes before buf[] read
     if (len > avail) len = avail;
 
     uint32_t tail_idx = rb->tail & (RING_BUF_SIZE - 1);

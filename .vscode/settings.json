@@ -1,15 +1,15 @@
 {
     "cmake.showSystemKits": false,
-    "cmake.options.statusBarVisibility": "hidden",
+    "cmake.options.statusBarVisibility": "compact",
     "cmake.options.advanced": {
         "build": {
-            "statusBarVisibility": "hidden"
+            "statusBarVisibility": "compact"
         },
         "launch": {
-            "statusBarVisibility": "hidden"
+            "statusBarVisibility": "compact"
         },
         "debug": {
-            "statusBarVisibility": "hidden"
+            "statusBarVisibility": "compact"
         }
     },
     "cmake.configureOnEdit": false,

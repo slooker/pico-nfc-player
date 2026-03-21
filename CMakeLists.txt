@@ -38,7 +38,7 @@ include(pico_sdk_import.cmake)
 # ---- pico-extras (Phase 3 I2S audio — optional) ----
 set(PICO_EXTRAS_PATH ${USERHOME}/.pico-sdk/pico-extras/2.2.0)
 set(PICO_EXTRAS_IMPORT ${CMAKE_CURRENT_LIST_DIR}/pico_extras_import.cmake)
-if (EXISTS ${PICO_EXTRAS_IMPORT})
+if (EXISTS ${PICO_EXTRAS_PATH} AND EXISTS ${PICO_EXTRAS_IMPORT})
     include(${PICO_EXTRAS_IMPORT})
     set(HAVE_PICO_EXTRAS TRUE)
     message(STATUS "pico-extras found — I2S audio enabled")
@@ -63,7 +63,7 @@ target_include_directories(pico_nfc_player PRIVATE
 
 set(LINK_LIBS
     pico_stdlib
-    pico_cyw43_arch_lwip_poll
+    pico_cyw43_arch_lwip_threadsafe_background
     pico_lwip_mbedtls
     pico_mbedtls
 )

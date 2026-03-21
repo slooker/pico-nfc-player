@@ -3,9 +3,9 @@
 
 #define NO_SYS                      1
 #define LWIP_SOCKET                 0
-#define MEM_LIBC_MALLOC             1
+#define MEM_LIBC_MALLOC             0
 #define MEM_ALIGNMENT               4
-#define MEM_SIZE                    16000
+#define MEM_SIZE                    32000
 #define MEMP_NUM_TCP_SEG            32
 #define MEMP_NUM_ARP_QUEUE          10
 #define PBUF_POOL_SIZE              24

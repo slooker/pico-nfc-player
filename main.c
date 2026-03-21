@@ -118,6 +118,33 @@ static void audio_init(uint32_t sample_rate) {
     printf("Audio initialised: %luHz stereo\n", (unsigned long)sample_rate);
 }
 
+static void play_test_tone(void) {
+    printf("Playing 440Hz test tone for 2 seconds...\n");
+    const uint32_t tone_freq   = 440;
+    const uint32_t sample_rate = 44100;
+    const uint32_t total_frames = sample_rate * 2;  // 2 seconds
+    const uint32_t half_cycle  = sample_rate / (tone_freq * 2);  // ~50 samples
+
+    uint32_t frames_done = 0, half_pos = 0;
+    int16_t level = 16000;
+
+    while (frames_done < total_frames) {
+        audio_buffer_t *buf = take_audio_buffer(g_audio_pool, true);
+        int16_t *out = (int16_t *)buf->buffer->bytes;
+        uint32_t n = 1152;
+        if (frames_done + n > total_frames) n = total_frames - frames_done;
+        for (uint32_t i = 0; i < n; i++) {
+            out[i * 2]     = level;
+            out[i * 2 + 1] = level;
+            if (++half_pos >= half_cycle) { level = -level; half_pos = 0; }
+        }
+        buf->sample_count = n;
+        give_audio_buffer(g_audio_pool, buf);
+        frames_done += n;
+    }
+    printf("Test tone done.\n");
+}
+
 static void audio_submit_frame(int16_t *pcm, int sample_count) {
     audio_buffer_t *buf = take_audio_buffer(g_audio_pool, false);
     if (!buf) return;  // no buffer available, skip frame rather than block
@@ -392,7 +419,7 @@ int main(void) {
 
     printf("Connecting to WiFi: %s\n", WIFI_SSID);
     if (cyw43_arch_wifi_connect_timeout_ms(
-            WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, 30000) != 0) {
+            WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_MIXED_PSK, 30000) != 0) {
         printf("WiFi connect failed\n");
         return -1;
     }
@@ -410,10 +437,17 @@ int main(void) {
         cyw43_arch_poll();
 
         // Decode one MP3 frame per loop iteration when enough data is buffered.
-        if (ring_buf_available(&g_ring) >= MINIMP3_MIN_DATA_CHUNK_SIZE) {
-            uint32_t avail   = ring_buf_available(&g_ring);
-            uint32_t to_read = (avail < sizeof(g_decode_scratch))
-                               ? avail : sizeof(g_decode_scratch);
+        static bool s_ring_low_reported = false;
+        uint32_t ring_avail = ring_buf_available(&g_ring);
+        if (audio_started && ring_avail < MINIMP3_MIN_DATA_CHUNK_SIZE && !s_ring_low_reported) {
+            printf("Ring buffer low (%lu bytes), waiting for network...\n", (unsigned long)ring_avail);
+            s_ring_low_reported = true;
+        } else if (ring_avail >= MINIMP3_MIN_DATA_CHUNK_SIZE) {
+            s_ring_low_reported = false;
+        }
+        if (ring_avail >= MINIMP3_MIN_DATA_CHUNK_SIZE) {
+            uint32_t to_read = (ring_avail < sizeof(g_decode_scratch))
+                               ? ring_avail : sizeof(g_decode_scratch);
 
             ring_buf_peek(&g_ring, g_decode_scratch, to_read);
 
@@ -423,7 +457,7 @@ int main(void) {
 
             if (g_frame_info.frame_bytes > 0) {
                 ring_buf_consume(&g_ring, (uint32_t)g_frame_info.frame_bytes);
-            } else if (avail > 0) {
+            } else if (ring_avail > 0) {
                 // No valid sync found — skip one byte and try again next iteration
                 ring_buf_consume(&g_ring, 1);
             }
@@ -435,6 +469,7 @@ int main(void) {
                            g_frame_info.bitrate_kbps);
 #ifdef PICO_AUDIO_I2S_ENABLED
                     audio_init((uint32_t)g_frame_info.hz);
+                    play_test_tone();
 #endif
                     audio_started = true;
                 }
@@ -442,13 +477,14 @@ int main(void) {
                 frame_count++;
                 total_samples += (uint32_t)samples;
 
-                // Print stats every 500 frames (~13 seconds at 38fps)
-                if (frame_count % 500 == 0) {
+                // Print stats every 50 frames (~1.3 seconds at 38fps)
+                if (frame_count % 50 == 0) {
                     uint32_t seconds = total_samples / (uint32_t)g_frame_info.hz;
-                    printf("Decoded %lu frames, ~%lu:%02lu elapsed\n",
+                    printf("Decoded %lu frames, ~%lu:%02lu, ring: %lu\n",
                            (unsigned long)frame_count,
                            (unsigned long)(seconds / 60),
-                           (unsigned long)(seconds % 60));
+                           (unsigned long)(seconds % 60),
+                           (unsigned long)ring_buf_available(&g_ring));
                 }
 
 #ifdef PICO_AUDIO_I2S_ENABLED
