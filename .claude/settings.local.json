@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /c/Users/shawn/.pico-sdk/sdk/2.2.0/lib/lwip -type f -name *.h -path *altcp*)",
+      "Bash(find /c/Users/shawn/.pico-sdk/sdk/2.2.0 -name *.c -path *altcp_tls* -type f)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(gh api:*)",
+      "Bash(find C:/Users/shawn/.pico-sdk/ -name audio_i2s*)",
+      "Bash(grep -v \"//\")"
+    ]
+  }
+}
