@@ -83,9 +83,14 @@ static uint8_t g_decode_scratch[4096];
 static uint g_i2s_sm = 0;
 static uint g_i2s_dma = 0;
 
-// Stereo PCM16 buffer: 1152 stereo pairs, 4 bytes each = 4608 bytes
-static int16_t g_audio_buf[2][1152 * 2];
+// DMA double-buffer: 2 frames × 1152 stereo pairs = 2304 stereo pairs each
+// (52 ms per transfer at 44100 Hz — doubles the window for TLS processing)
+static int16_t g_audio_buf[2][2304 * 2];
 static uint    g_audio_buf_idx = 0;
+
+// Accumulate two decoded frames before each DMA submit
+static int16_t g_audio_accum[2304 * 2];
+static uint32_t g_audio_accum_pairs = 0;
 
 static void audio_init(uint32_t sample_rate) {
     // --- PIO setup ---
@@ -554,7 +559,17 @@ int main(void) {
                 }
 
 #ifdef PICO_AUDIO_I2S_ENABLED
-                audio_submit_frame(g_pcm_buf, samples * g_frame_info.channels);
+                // Accumulate into staging buffer; submit every 2 frames (52 ms)
+                // so TLS decryption has twice as long to complete inside the
+                // DMA wait before a gap can occur.
+                uint32_t new_pairs = (uint32_t)(samples * g_frame_info.channels) / 2;
+                memcpy(g_audio_accum + g_audio_accum_pairs * 2,
+                       g_pcm_buf, new_pairs * 4);
+                g_audio_accum_pairs += new_pairs;
+                if (g_audio_accum_pairs >= 2304) {
+                    audio_submit_frame(g_audio_accum, (int)(g_audio_accum_pairs * 2));
+                    g_audio_accum_pairs = 0;
+                }
 #endif
             }
         }
