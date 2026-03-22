@@ -13,7 +13,7 @@
 #define MINIMP3_IMPLEMENTATION
 #include "minimp3.h"
 #ifndef MINIMP3_MIN_DATA_CHUNK_SIZE
-#define MINIMP3_MIN_DATA_CHUNK_SIZE 16384
+#define MINIMP3_MIN_DATA_CHUNK_SIZE 4096
 #endif
 #include "ring_buffer.h"
 
@@ -146,8 +146,10 @@ static void audio_init(uint32_t sample_rate) {
 static void audio_submit_raw(const int16_t *pcm, uint32_t stereo_pairs) {
     uint32_t next_idx = g_audio_buf_idx ^ 1;
     memcpy(g_audio_buf[next_idx], pcm, stereo_pairs * 4);
-    // Wait for previous DMA to finish, then kick off the next transfer
-    dma_channel_wait_for_finish_blocking(g_i2s_dma);
+    // Poll WiFi while waiting so the TCP stack stays alive during the ~22ms DMA transfer
+    while (dma_channel_is_busy(g_i2s_dma)) {
+        cyw43_arch_poll();
+    }
     dma_channel_transfer_from_buffer_now(g_i2s_dma, g_audio_buf[next_idx], stereo_pairs);
     g_audio_buf_idx = next_idx;
 }
@@ -220,6 +222,7 @@ typedef struct {
     bool     headers_done;
     bool     is_chunked;
     uint32_t bytes_received;
+    uint32_t bytes_rx_unacked; // bytes received but not yet altcp_recved'd
     // chunked parser
     chunk_state_t chunk_state;
     char     chunk_header_buf[16];
@@ -359,7 +362,8 @@ static err_t stream_recv(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err_t
         curr = curr->next;
     }
 
-    altcp_recved(pcb, p->tot_len);
+    // Accumulate for gradual acking in the main loop.
+    g_stream.bytes_rx_unacked += p->tot_len;
     pbuf_free(p);
     return ERR_OK;
 }
@@ -458,42 +462,104 @@ int main(void) {
 
     printf("Pico NFC Player starting...\n");
 
-    // mp3dec_init(&g_mp3dec);
+    mp3dec_init(&g_mp3dec);
     ring_buf_init(&g_ring);
 
-    // if (cyw43_arch_init()) {
-    //     printf("WiFi init failed!\n");
-    //     return -1;
-    // }
-    // cyw43_arch_enable_sta_mode();
+    if (cyw43_arch_init()) {
+        printf("WiFi init failed!\n");
+        return -1;
+    }
+    cyw43_arch_enable_sta_mode();
 
-    // printf("Connecting to WiFi: %s\n", WIFI_SSID);
-    // if (cyw43_arch_wifi_connect_timeout_ms(
-    //         WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_MIXED_PSK, 30000) != 0) {
-    //     printf("WiFi connect failed\n");
-    //     return -1;
-    // }
-    // printf("WiFi connected! IP: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_default)));
+    printf("Connecting to WiFi: %s\n", WIFI_SSID);
+    if (cyw43_arch_wifi_connect_timeout_ms(
+            WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_MIXED_PSK, 30000) != 0) {
+        printf("WiFi connect failed\n");
+        return -1;
+    }
+    printf("WiFi connected! IP: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_default)));
 
     // Phase 4 placeholder: in the final design this fires when an NFC tag is scanned.
     // For now, auto-start with the first map entry so Phases 2+3 can be tested.
-    // start_stream(NFC_MAP[0].subsonic_id);
+    start_stream(NFC_MAP[0].subsonic_id);
 
-    // bool     audio_started = false;
-    // uint32_t frame_count   = 0;
-    // uint32_t total_samples = 0;
-
-#ifdef PICO_AUDIO_I2S_ENABLED
-    audio_init(44100);
-    printf("Starting test tone\n");
-    play_test_tone();
-    printf("Done playing test tone\n");
-#endif
+    bool     audio_started = false;
+    uint32_t frame_count   = 0;
+    uint32_t total_samples = 0;
 
     while (true) {
-        tight_loop_contents();
+        cyw43_arch_poll();
+
+        // Open the TCP receive window at the decode rate.  We cap each iteration
+        // to 512 bytes (roughly one frame) so the server never sends faster than
+        // we can buffer, and we always ack even when the ring is empty so the
+        // window never stays closed during a brief underrun.
+        if (g_stream.pcb && g_stream.bytes_rx_unacked > 0) {
+            uint32_t ring_free = ring_buf_free(&g_ring);
+            uint32_t to_ack = g_stream.bytes_rx_unacked;
+            if (to_ack > ring_free) to_ack = ring_free;
+            if (to_ack > 512)      to_ack = 512;   // one frame max per iteration
+            if (to_ack > 0) {
+                altcp_recved(g_stream.pcb, (u16_t)to_ack);
+                g_stream.bytes_rx_unacked -= to_ack;
+            }
+        }
+
+        // Decode one MP3 frame per loop iteration when enough data is buffered.
+        // 512 bytes is just over one 128 kbps frame so minimp3 always has a
+        // complete frame; the larger threshold only applies before the first frame.
+        uint32_t ring_avail = ring_buf_available(&g_ring);
+        uint32_t decode_threshold = audio_started ? 512u : MINIMP3_MIN_DATA_CHUNK_SIZE;
+
+        if (ring_avail >= decode_threshold) {
+            uint32_t to_read = (ring_avail < sizeof(g_decode_scratch))
+                               ? ring_avail : sizeof(g_decode_scratch);
+
+            ring_buf_peek(&g_ring, g_decode_scratch, to_read);
+
+            int samples = mp3dec_decode_frame(
+                &g_mp3dec, g_decode_scratch, (int)to_read,
+                g_pcm_buf, &g_frame_info);
+
+            if (g_frame_info.frame_bytes > 0) {
+                ring_buf_consume(&g_ring, (uint32_t)g_frame_info.frame_bytes);
+            } else if (ring_avail >= MINIMP3_MIN_DATA_CHUNK_SIZE) {
+                // Enough data to have found a frame but didn't — corrupted byte,
+                // skip it.  Don't skip when ring is low; it just means incomplete.
+                ring_buf_consume(&g_ring, 1);
+            }
+
+            if (samples > 0) {
+                if (!audio_started) {
+                    printf("Decoded first frame: %dHz, %dch, %d kbps\n",
+                           g_frame_info.hz, g_frame_info.channels,
+                           g_frame_info.bitrate_kbps);
+#ifdef PICO_AUDIO_I2S_ENABLED
+                    audio_init((uint32_t)g_frame_info.hz);
+#endif
+                    audio_started = true;
+                }
+
+                frame_count++;
+                total_samples += (uint32_t)samples;
+
+                // Print stats every 50 frames (~1.3 seconds at 38fps)
+                if (frame_count % 50 == 0) {
+                    uint32_t seconds = total_samples / (uint32_t)g_frame_info.hz;
+                    printf("Decoded %lu frames, ~%lu:%02lu, ring: %lu\n",
+                           (unsigned long)frame_count,
+                           (unsigned long)(seconds / 60),
+                           (unsigned long)(seconds % 60),
+                           (unsigned long)ring_buf_available(&g_ring));
+                }
+
+#ifdef PICO_AUDIO_I2S_ENABLED
+                audio_submit_frame(g_pcm_buf, samples * g_frame_info.channels);
+#endif
+            }
+        }
     }
 
-    // cyw43_arch_deinit();
+    cyw43_arch_deinit();
     return 0;
 }
