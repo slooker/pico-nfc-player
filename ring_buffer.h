@@ -3,7 +3,7 @@
 #include <string.h>
 
 // Power-of-2 size so index masking works correctly
-#define RING_BUF_SIZE (32 * 1024)
+#define RING_BUF_SIZE (64 * 1024)
 
 // SPSC ring buffer: one producer (network IRQ) and one consumer (main thread).
 // volatile + __dmb() provide the ordering guarantees needed on Cortex-M33.
